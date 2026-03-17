@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Shatter Clock</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; background:#000; overflow:hidden; }
+  canvas { display:block; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); }
+  #loader {
+    position:fixed; inset:0; background:#020810;
+    display:flex; align-items:center; justify-content:center;
+    font:12px/1 monospace; color:#1a3a6a; letter-spacing:.25em; z-index:9;
+    transition:opacity .8s;
+  }
+</style>
+</head>
+<body>
+<div id="loader">SHATTERING…</div>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const LW = 540, LH = 960;
+canvas.width = LW; canvas.height = LH;
+
+function fit(){
+  const s = Math.min(innerWidth/LW, innerHeight/LH);
+  canvas.style.width=(LW*s)+'px'; canvas.style.height=(LH*s)+'px';
+}
+fit(); addEventListener('resize', fit);
+
+// ── RNG ───────────────────────────────────────────────────────────────────────
+let _s = 0xC0FFEE42;
+function rng(){ _s^=_s<<13; _s^=_s>>>17; _s^=_s<<5; return (_s>>>0)/0xFFFFFFFF; }
+function rr(a,b){ return a+rng()*(b-a); }
+
+// ── Clock params ──────────────────────────────────────────────────────────────
+const HX = LW*0.50, HY = LH*0.36;
+const CLK_R = 105;   // smaller frame
+
+// ── Seeds — denser near impact, sparser at edges ──────────────────────────────
+const seeds = [];
+for(let i=0;i<11;i++){               // impact zone — medium count, big enough shards
+  const a=rng()*Math.PI*2, r=rr(CLK_R*0.8, CLK_R*2.8);
+  seeds.push({ x:HX+Math.cos(a)*r, y:HY+Math.sin(a)*r });
+}
+for(let i=0;i<9;i++){                // rest of screen — sparse = big panels
+  seeds.push({ x:rr(50,LW-50), y:rr(50,LH-50) });
+}
+// Boundary — well outside canvas so edge shards are large
+seeds.push(
+  {x:-200,y:LH*.1},{x:-200,y:LH*.5},{x:-200,y:LH*.85},
+  {x:LW+200,y:LH*.2},{x:LW+200,y:LH*.6},{x:LW+200,y:LH*.9},
+  {x:LW*.2,y:-200},{x:LW*.65,y:-200},
+  {x:LW*.15,y:LH+200},{x:LW*.55,y:LH+200},{x:LW*.85,y:LH+200}
+);
+const NS = seeds.length;
+
+// ── Sutherland-Hodgman polygon clipping by half-plane ─────────────────────────
+// Keep side where point is closer to si than sj
+function clipByBisector(poly, si, sj){
+  if(poly.length===0) return [];
+  const mx=(si.x+sj.x)/2, my=(si.y+sj.y)/2;
+  const nx=sj.x-si.x, ny=sj.y-si.y;
+  const result=[];
+  for(let k=0;k<poly.length;k++){
+    const a=poly[k], b=poly[(k+1)%poly.length];
+    const da=(a.x-mx)*nx+(a.y-my)*ny;
+    const db=(b.x-mx)*nx+(b.y-my)*ny;
+    const aIn=da<=0, bIn=db<=0;
+    if(aIn) result.push({x:a.x,y:a.y});
+    if(aIn!==bIn){
+      const t=da/(da-db);
+      result.push({x:a.x+t*(b.x-a.x), y:a.y+t*(b.y-a.y)});
+    }
+  }
+  return result;
+}
+
+// ── Compute Voronoi polygon for each seed ─────────────────────────────────────
+const PAD = 250;
+const bounds = [
+  {x:-PAD,y:-PAD},{x:LW+PAD,y:-PAD},
+  {x:LW+PAD,y:LH+PAD},{x:-PAD,y:LH+PAD}
+];
+
+const cells = seeds.map((si,i)=>{
+  let poly = bounds.map(p=>({x:p.x,y:p.y}));
+  for(let j=0;j<NS;j++){
+    if(j===i) continue;
+    poly = clipByBisector(poly, si, seeds[j]);
+    if(poly.length===0) break;
+  }
+  return poly;
+});
+
+// ── Per-shard physics — "frozen moment" displacement ─────────────────────────
+const shardData = seeds.map((s,i)=>{
+  const dx=s.x-HX, dy=s.y-HY;
+  const dist=Math.sqrt(dx*dx+dy*dy)+1;
+
+  // Displacement: outward from impact, stronger when closer
+  const force = Math.min(800/dist, 1.0) * rr(0.7,1.3);
+  const dispX = (dx/dist)*force*rr(18,55);
+  const dispY = (dy/dist)*force*rr(18,55);
+
+  // Rotation: slight tumble, more for closer shards
+  const rot = (rng()-0.5) * force * 0.18;
+
+  // Glass face color — each shard tilted differently = different brightness
+  const bright = rr(0.50, 1.55);
+  const tiltAx = rr(-0.7, 0.7);
+  const tiltAy = rr(-0.7, 0.7);
+  const hueOff = rr(-12, 12);
+
+  // Centroid
+  const poly = cells[i];
+  let cx=0,cy=0;
+  poly.forEach(p=>{cx+=p.x;cy+=p.y;});
+  cx/=Math.max(poly.length,1); cy/=Math.max(poly.length,1);
+
+  return { dispX, dispY, rot, bright, tiltAx, tiltAy, hueOff, cx, cy };
+});
+
+// Light direction
+const LDX=-0.62, LDY=-0.78;
+
+// ── Draw single shard ─────────────────────────────────────────────────────────
+function drawShard(i, shimmer){
+  const poly = cells[i];
+  if(poly.length<3) return;
+  const sd  = shardData[i];
+  const s   = seeds[i];
+
+  ctx.save();
+
+  // Apply "mid-flight" transform — translate to centroid, rotate, translate back + displacement
+  ctx.translate(sd.cx + sd.dispX, sd.cy + sd.dispY);
+  ctx.rotate(sd.rot);
+  ctx.translate(-sd.cx, -sd.cy);
+
+  // Build clip path
+  ctx.beginPath();
+  ctx.moveTo(poly[0].x, poly[0].y);
+  for(let k=1;k<poly.length;k++) ctx.lineTo(poly[k].x, poly[k].y);
+  ctx.closePath();
+  ctx.clip();
+
+  // ── Shard thickness edges (cut glass face) ───────────────────────────────
+  // Draw a dark shadow slightly INSET to simulate cut-glass thickness
+  const THICKNESS = 10;
+  ctx.strokeStyle='rgba(1,3,10,0.95)';
+  ctx.lineWidth=THICKNESS*2;    // doubled because half is outside clip
+  ctx.lineJoin='round';
+  ctx.beginPath();
+  ctx.moveTo(poly[0].x, poly[0].y);
+  for(let k=1;k<poly.length;k++) ctx.lineTo(poly[k].x, poly[k].y);
+  ctx.closePath();
+  ctx.stroke();
+
+  // Bevel highlight on lit edges
+  for(let k=0;k<poly.length;k++){
+    const p1=poly[k], p2=poly[(k+1)%poly.length];
+    const ex=p2.x-p1.x, ey=p2.y-p1.y;
+    const el=Math.sqrt(ex*ex+ey*ey)+1e-5;
+    // Inward normal
+    const nx=ey/el, ny=-ex/el;
+    const ndot=nx*LDX+ny*LDY;
+
+    if(ndot>0.05){
+      // Lit cut face
+      const alpha=(ndot*0.85+shimmer*0.08)*sd.bright*0.7;
+      ctx.strokeStyle=`rgba(120,185,255,${Math.min(0.9,alpha)})`;
+      ctx.lineWidth=THICKNESS*1.6;
+      ctx.lineCap='round';
+      ctx.beginPath(); ctx.moveTo(p1.x,p1.y); ctx.lineTo(p2.x,p2.y); ctx.stroke();
+
+      // Sharp specular glint line
+      ctx.strokeStyle=`rgba(200,235,255,${Math.min(0.7,ndot*0.6+shimmer*0.06)})`;
+      ctx.lineWidth=1.2;
+      ctx.beginPath(); ctx.moveTo(p1.x,p1.y); ctx.lineTo(p2.x,p2.y); ctx.stroke();
+    }
+  }
+
+  // ── Glass face fill ───────────────────────────────────────────────────────
+  // Radial from shard centroid
+  const faceGrad=ctx.createRadialGradient(
+    sd.cx-30*sd.tiltAx, sd.cy-30*sd.tiltAy, 0,
+    sd.cx, sd.cy, 220
+  );
+
+  const b=sd.bright, h=sd.hueOff;
+  faceGrad.addColorStop(0,   `rgba(${Math.round((42+h*0.8)*b)},${Math.round((88)*b)},${Math.round((175)*b)},0.88)`);
+  faceGrad.addColorStop(0.5, `rgba(${Math.round((20+h*0.5)*b)},${Math.round((52)*b)},${Math.round((118)*b)},0.92)`);
+  faceGrad.addColorStop(1,   `rgba(${Math.round((8)*b)},${Math.round((24)*b)},${Math.round((62)*b)},0.95)`);
+
+  ctx.fillStyle=faceGrad;
+  ctx.beginPath();
+  ctx.moveTo(poly[0].x,poly[0].y);
+  for(let k=1;k<poly.length;k++) ctx.lineTo(poly[k].x,poly[k].y);
+  ctx.closePath();
+  ctx.fill();
+
+  // Internal reflection streak — simulates light bouncing inside glass
+  const refGrad=ctx.createLinearGradient(
+    sd.cx+sd.tiltAx*80, sd.cy+sd.tiltAy*80,
+    sd.cx-sd.tiltAx*80, sd.cy-sd.tiltAy*80
+  );
+  const ra=0.10+shimmer*0.05;
+  refGrad.addColorStop(0,  'rgba(0,0,0,0)');
+  refGrad.addColorStop(0.4,`rgba(65,130,220,${ra*b})`);
+  refGrad.addColorStop(0.6,`rgba(80,150,240,${(ra+0.06)*b})`);
+  refGrad.addColorStop(1,  'rgba(0,0,0,0)');
+  ctx.fillStyle=refGrad;
+  ctx.beginPath();
+  ctx.moveTo(poly[0].x,poly[0].y);
+  for(let k=1;k<poly.length;k++) ctx.lineTo(poly[k].x,poly[k].y);
+  ctx.closePath();
+  ctx.fill();
+
+  // Frost micro-texture (subtle)
+  // Skip pixel-level frost here; the gradient variation already gives texture
+
+  ctx.restore();
+}
+
+// ── Date bar ──────────────────────────────────────────────────────────────────
+const BAR_W = CLK_R*2.2, BAR_H = 38;
+const BAR_X = HX-BAR_W/2, BAR_Y = HY+CLK_R+22;
+
+function drawDateBar(shimmer){
+  const now=new Date();
+  const days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const months=['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const dateStr=`${days[now.getDay()]}, ${now.getDate()} ${months[now.getMonth()]}`;
+  const x=BAR_X,y=BAR_Y,w=BAR_W,h=BAR_H,cr=9;
+  ctx.save();
+
+  function rrect(){
+    ctx.beginPath();
+    ctx.moveTo(x+cr,y); ctx.lineTo(x+w-cr,y);
+    ctx.arcTo(x+w,y,x+w,y+cr,cr); ctx.lineTo(x+w,y+h-cr);
+    ctx.arcTo(x+w,y+h,x+w-cr,y+h,cr); ctx.lineTo(x+cr,y+h);
+    ctx.arcTo(x,y+h,x,y+h-cr,cr); ctx.lineTo(x,y+cr);
+    ctx.arcTo(x,y,x+cr,y,cr); ctx.closePath();
+  }
+
+  const bg=ctx.createLinearGradient(x,y,x,y+h);
+  bg.addColorStop(0,`rgba(22,55,120,${0.44+shimmer*.06})`);
+  bg.addColorStop(1,`rgba(11,30,75,${0.52+shimmer*.04})`);
+  rrect(); ctx.fillStyle=bg; ctx.fill();
+
+  const border=ctx.createLinearGradient(x,y,x+w,y+h);
+  border.addColorStop(0,  `rgba(150,208,255,${0.58+shimmer*.10})`);
+  border.addColorStop(0.5,`rgba(60,120,210,0.22)`);
+  border.addColorStop(1,  `rgba(25,62,150,0.16)`);
+  ctx.strokeStyle=border; ctx.lineWidth=0.9;
+  rrect(); ctx.stroke();
+
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.font=`300 18px 'Helvetica Neue',Helvetica,Arial,sans-serif`;
+  ctx.fillStyle=`rgba(198,226,255,${0.86+shimmer*.05})`;
+  ctx.shadowColor='rgba(80,160,255,0.16)'; ctx.shadowBlur=8;
+  ctx.fillText(dateStr, x+w/2, y+h/2+1);
+  ctx.shadowBlur=0;
+  ctx.restore();
+}
+
+// ── Analog clock ──────────────────────────────────────────────────────────────
+function drawClock(shimmer){
+  const now=new Date();
+  const sec=now.getSeconds()+now.getMilliseconds()/1000;
+  const min=now.getMinutes()+sec/60;
+  const hour=(now.getHours()%12)+min/60;
+  const cx=HX,cy=HY,r=CLK_R;
+  ctx.save();
+
+  // Face
+  const face=ctx.createRadialGradient(cx-r*.20,cy-r*.22,0,cx,cy,r);
+  face.addColorStop(0,  'rgba(16,44,98,0.82)');
+  face.addColorStop(0.55,'rgba(9,26,65,0.90)');
+  face.addColorStop(1,  'rgba(3,9,28,0.96)');
+  ctx.fillStyle=face;
+  ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+
+  // Specular
+  const sp=ctx.createRadialGradient(cx-r*.26,cy-r*.28,0,cx,cy,r*.68);
+  sp.addColorStop(0,  `rgba(55,115,210,${0.24+shimmer*.07})`);
+  sp.addColorStop(0.65,'rgba(20,55,132,0.04)');
+  sp.addColorStop(1,  'rgba(0,0,0,0)');
+  ctx.fillStyle=sp; ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+
+  // Rim
+  const rimG=ctx.createConicGradient(Math.PI*1.22,cx,cy);
+  rimG.addColorStop(0,   `rgba(165,218,255,${0.70+shimmer*.10})`);
+  rimG.addColorStop(0.12,`rgba(90,158,242,${0.48+shimmer*.08})`);
+  rimG.addColorStop(0.30,`rgba(32,75,160,0.24)`);
+  rimG.addColorStop(0.55,`rgba(10,25,68,0.18)`);
+  rimG.addColorStop(0.82,`rgba(20,52,120,0.28)`);
+  rimG.addColorStop(1,   `rgba(165,218,255,${0.70+shimmer*.10})`);
+  ctx.strokeStyle=rimG; ctx.lineWidth=2.0;
+  ctx.shadowColor=`rgba(80,160,255,${0.18+shimmer*.07})`; ctx.shadowBlur=12;
+  ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.stroke();
+  ctx.shadowBlur=0;
+
+  // Inner ring
+  ctx.strokeStyle=`rgba(48,105,188,${0.20+shimmer*.05})`; ctx.lineWidth=0.8;
+  ctx.beginPath(); ctx.arc(cx,cy,r*.76,0,Math.PI*2); ctx.stroke();
+
+  // Ticks
+  for(let i=0;i<60;i++){
+    const a=(i/60)*Math.PI*2-Math.PI/2, big=i%5===0;
+    ctx.strokeStyle=big?`rgba(118,182,250,0.74)`:`rgba(58,112,195,0.26)`;
+    ctx.lineWidth=big?1.8:0.7; ctx.lineCap='round';
+    const r1=r-4, r2=r1-(big?14:6);
+    ctx.beginPath();
+    ctx.moveTo(cx+Math.cos(a)*r1,cy+Math.sin(a)*r1);
+    ctx.lineTo(cx+Math.cos(a)*r2,cy+Math.sin(a)*r2);
+    ctx.stroke();
+  }
+
+  ctx.lineCap='round';
+  const ha=(hour/12)*Math.PI*2-Math.PI/2;
+  ctx.strokeStyle='rgba(208,232,255,0.92)'; ctx.lineWidth=4.5;
+  ctx.shadowColor='rgba(110,182,255,0.24)'; ctx.shadowBlur=9;
+  ctx.beginPath();
+  ctx.moveTo(cx-Math.cos(ha)*r*.14,cy-Math.sin(ha)*r*.14);
+  ctx.lineTo(cx+Math.cos(ha)*r*.52,cy+Math.sin(ha)*r*.52);
+  ctx.stroke();
+
+  const ma=(min/60)*Math.PI*2-Math.PI/2;
+  ctx.strokeStyle='rgba(175,218,255,0.84)'; ctx.lineWidth=2.8; ctx.shadowBlur=6;
+  ctx.beginPath();
+  ctx.moveTo(cx-Math.cos(ma)*r*.14,cy-Math.sin(ma)*r*.14);
+  ctx.lineTo(cx+Math.cos(ma)*r*.73,cy+Math.sin(ma)*r*.73);
+  ctx.stroke();
+
+  const sa=(sec/60)*Math.PI*2-Math.PI/2;
+  ctx.strokeStyle='rgba(45,158,255,0.88)'; ctx.lineWidth=1.2;
+  ctx.shadowColor='rgba(25,130,255,0.42)'; ctx.shadowBlur=11;
+  ctx.beginPath();
+  ctx.moveTo(cx-Math.cos(sa)*r*.20,cy-Math.sin(sa)*r*.20);
+  ctx.lineTo(cx+Math.cos(sa)*r*.80,cy+Math.sin(sa)*r*.80);
+  ctx.stroke();
+
+  ctx.fillStyle='rgba(178,224,255,0.95)';
+  ctx.shadowColor='rgba(100,180,255,0.52)'; ctx.shadowBlur=13;
+  ctx.beginPath(); ctx.arc(cx,cy,4,0,Math.PI*2); ctx.fill();
+  ctx.shadowBlur=0;
+  ctx.restore();
+}
+
+// ── Render loop ───────────────────────────────────────────────────────────────
+let last=0;
+function frame(ts){
+  requestAnimationFrame(frame);
+  if(ts-last<1000/30) return;
+  last=ts;
+  const t=ts/1000;
+  const shimmer=0.5+0.5*Math.sin(t*0.20);
+
+  // Background — black void (gaps between shards show this)
+  ctx.fillStyle='#010508'; ctx.fillRect(0,0,LW,LH);
+
+  // Draw all shards
+  for(let i=0;i<NS;i++) drawShard(i, shimmer);
+
+  // Subtle explosion glow from impact center
+  const eg=ctx.createRadialGradient(HX,HY,0,HX,HY,CLK_R*2.5);
+  eg.addColorStop(0,  `rgba(12,40,115,${0.28+shimmer*.08})`);
+  eg.addColorStop(0.4,`rgba(5,18,58,0.10)`);
+  eg.addColorStop(1,  'rgba(0,0,0,0)');
+  ctx.fillStyle=eg; ctx.fillRect(0,0,LW,LH);
+
+  drawClock(shimmer);
+  drawDateBar(shimmer);
+
+  // Vignette
+  const v=ctx.createRadialGradient(LW*.5,LH*.44,LH*.20,LW*.5,LH*.5,LH*.90);
+  v.addColorStop(0,  'rgba(0,0,0,0)');
+  v.addColorStop(0.6,'rgba(0,2,8,0.16)');
+  v.addColorStop(1,  'rgba(0,1,6,0.75)');
+  ctx.fillStyle=v; ctx.fillRect(0,0,LW,LH);
+}
+
+setTimeout(()=>{
+  const ldr=document.getElementById('loader');
+  ldr.style.opacity='0'; setTimeout(()=>ldr.remove(),800);
+  requestAnimationFrame(frame);
+},50);
+</script>
+</body>
+</html>
