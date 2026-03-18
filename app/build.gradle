@@ -4,6 +4,7 @@ plugins {
 }
 
 android {
+    namespace 'com.shatter.wallpaper'
     compileSdk 34
     defaultConfig {
         applicationId "com.shatter.wallpaper"
