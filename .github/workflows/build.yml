@@ -1,4 +1,3 @@
-
 name: Build APK
 
 on:
@@ -18,11 +17,15 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
-        uses: gradle/gradle-build-action@v3
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      - name: Generate Gradle Wrapper
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.2-bin.zip -P /tmp
+          unzip -q /tmp/gradle-8.2-bin.zip -d /tmp
+          /tmp/gradle-8.2/bin/gradle wrapper
+          chmod +x ./gradlew
 
       - name: Build Release APK
         run: ./gradlew assembleRelease
